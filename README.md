@@ -107,5 +107,5 @@ Issues and pull requests are welcome. For substantial changes, please open an is
 
 ## License
 
-No open-source license has been selected yet. Add a `LICENSE` file before a public release; without one, the code is not automatically open for reuse.
+MIT License
 
