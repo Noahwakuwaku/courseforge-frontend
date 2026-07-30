@@ -1,4 +1,6 @@
 # CourseForge 前端
+- Frontend: https://github.com/Noahwakuwaku/courseforge-frontend
+- Backend: https://github.com/Noahwakuwaku/courseforge-api
 
 简体中文 | [English](README.md)
 
