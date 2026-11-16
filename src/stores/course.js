@@ -1,461 +1,181 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { api, pollTask, pollTasksBatch } from '../api'
+import { api, pollTasksBatch } from '../api/index.js'
+import { itemKey } from '../utils/course.js'
+import { createDemoSnapshot, demoContent } from '../data/demo.js'
 
 export const useCourseStore = defineStore('course', () => {
-    const allSubjects = ref([])
-    const subjectId   = ref(null)
-    const subjectName = ref('')
-    const courses     = ref([])
-    const outlines    = ref({})
-    const materials   = ref({})
-    const exams       = ref({})
-    const loadingMap  = ref({})
-
-    // Batch progress keyed BY SUBJECT so multiple subjects can have
-    // independent in-flight batches and the UI shows the right one.
-    //   batchProgress[`batch-outline:${subjectId}`] = { done, total, failed }
-    const batchProgress = ref({})
-
-    const isLoading  = (key) => !!loadingMap.value[key]
-    const setLoading = (key, v) => { loadingMap.value[key] = v }
-
-    // ── batch state helpers (subject-scoped) ─────────────────────────────────────
-    //
-    // A batch operation lives on ONE subject — the one that was active when the
-    // user clicked the button. State keys carry that subject id so:
-    //   1. Navigating to a different subject doesn't disable that subject's own
-    //      batch buttons.
-    //   2. Navigating back to the originating subject still shows live progress.
-
-    function batchKey(type, sid) { return `${type}:${sid}` }
-
-    /** Is there a batch of `type` running on the currently-active subject? */
-    function isBatchActive(type) {
-        if (!subjectId.value) return false
-        return !!loadingMap.value[batchKey(type, subjectId.value)]
+  const allSubjects = ref([]), subjectId = ref(null), subjectName = ref(''), courses = ref([])
+  const outlines = ref({}), materials = ref({}), exams = ref({})
+  const loadingMap = ref({}), reports = ref({}), itemErrors = ref({}), demo = ref(false), online = ref(null)
+  let navigation = 0, revision = 0
+  const versions = new Map()
+  const isLoading = key => !!loadingMap.value[key]
+  const activeWorkSubjects = computed(() => new Set(Object.entries(reports.value).filter(([, r]) => r.running).map(([sid]) => sid)))
+  const anyWork = computed(() => Object.values(loadingMap.value).some(Boolean) || Object.values(reports.value).some(r => r.running || r.uncertain))
+  const currentReport = computed(() => reports.value[subjectId.value] || null)
+  const write = (group, key, value) => { group.value[key] = value; versions.set(`${group === outlines ? 'o' : group === materials ? 'm' : 'e'}:${key}`, ++revision) }
+  function merge(group, prefix, incoming, since) {
+    for (const [key, value] of Object.entries(incoming || {})) if ((versions.get(`${prefix}:${key}`) || 0) <= since) group.value[key] = value
+  }
+  async function fetchAllSubjects() {
+    if (demo.value) return
+    loadingMap.value.sidebar = true
+    try { allSubjects.value = await api.listSubjects(); online.value = true }
+    catch (e) { online.value = false; throw e }
+    finally { loadingMap.value.sidebar = false }
+  }
+  async function loadSubject(id) {
+    if (demo.value) { subjectId.value = 'demo-subject'; subjectName.value = '产品设计基础'; return }
+    const nav = ++navigation, since = revision
+    loadingMap.value[`load:${id}`] = true
+    try {
+      const snap = await api.getSnapshot(id)
+      if (nav !== navigation) return
+      subjectId.value = snap.subject._id; subjectName.value = snap.subject.name; courses.value = snap.courses
+      merge(outlines, 'o', snap.outlines, since); merge(materials, 'm', snap.materials, since); merge(exams, 'e', snap.exams, since)
+    } finally { loadingMap.value[`load:${id}`] = false }
+  }
+  function home() { ++navigation; subjectId.value = null; subjectName.value = ''; if (!demo.value) courses.value = [] }
+  async function createSubjects(names) {
+    if (demo.value) throw new Error('请先退出示例，再创建真实课程计划。')
+    if (isLoading('skeleton')) return
+    loadingMap.value.skeleton = true
+    const failures = [], created = []
+    try {
+      for (const name of names) { try { created.push(await api.createSubject(name)) } catch { failures.push(name) } }
+      await fetchAllSubjects()
+      if (created.length === 1) await loadSubject(created[0].subject_id)
+      if (failures.length) throw new Error(`未能创建：${failures.join('、')}。其余成功计划已保留。`)
+    } finally { loadingMap.value.skeleton = false }
+  }
+  async function refreshCourses(sid) {
+    if (demo.value) return
+    const fresh = await api.getCourses(sid)
+    if (subjectId.value === sid) courses.value = fresh
+  }
+  async function expandAll() {
+    const sid = subjectId.value
+    if (!sid || reports.value[sid]?.running || reports.value[sid]?.uncertain) return
+    if (demo.value) throw new Error('示例课程已规划好分类，可直接生成内容。')
+    reports.value[sid] = { kind: 'expand', total: 0, done: 0, failures: [], pending: [], running: true }
+    const report = reports.value[sid]
+    loadingMap.value[`expand:${sid}`] = true
+    try {
+      const { tasks } = await api.expandSubjectAsync(sid)
+      report.total = tasks.length
+      report.pending = tasks.map(t => ({ taskId: t.task_id, id: t.course_id, type: 'course' }))
+      await monitor(report)
+      await refreshCourses(sid)
+    } catch (e) {
+      report.uncertain = report.pending.length > 0 || !e.status || e.status >= 500
+      report.message = report.uncertain && !report.pending.length ? `${e.message} 请先在后端核对是否已派发分类任务，避免重复生成。` : e.message
+      throw e
     }
-
-    /** Progress object for the current subject's batch, or null. */
-    function batchInfo(type) {
-        if (!subjectId.value) return null
-        return batchProgress.value[batchKey(type, subjectId.value)] || null
-    }
-
-    /** Set of subject IDs that have ANY active batch / expand work running.
-     *  Used by the sidebar to render a "still working" indicator on subjects
-     *  the user isn't currently looking at. */
-    const activeWorkSubjects = computed(() => {
-        const active = new Set()
-        for (const k of Object.keys(loadingMap.value)) {
-            if (!loadingMap.value[k]) continue
-            const m = k.match(/^(batch-outline|batch-material|batch-exam|expand):(.+)$/)
-            if (m) active.add(m[2])
-        }
-        return active
+    finally { report.running = false; loadingMap.value[`expand:${sid}`] = false }
+  }
+  function finish(report, item, result) {
+    if (report.kind === 'outline') write(outlines, itemKey(item), { ...result.content, lectureId: result.lecture_id })
+    if (report.kind === 'material') write(materials, item.lectureId, { ...result.material, materialId: result.material_id })
+    if (report.kind === 'exam') write(exams, item.materialId, result.questions)
+    report.done++; loadingMap.value[itemKey(item)] = false; delete itemErrors.value[itemKey(item)]
+  }
+  function fail(report, item, error) {
+    const message = String(error?.message || error)
+    report.failures.push({ ...item, message }); itemErrors.value[itemKey(item)] = { kind: report.kind, message }
+    loadingMap.value[itemKey(item)] = false
+  }
+  async function monitor(report) {
+    const remove = item => { report.pending = report.pending.filter(p => p.taskId !== item.taskId) }
+    await pollTasksBatch([...report.pending], {
+      onItem: ({ item, result }) => { finish(report, item, result); remove(item) },
+      onError: ({ item, error }) => { fail(report, item, error); remove(item) },
     })
-
-    // ── sidebar ──────────────────────────────────────────────────────────────────
-    async function fetchAllSubjects() {
-        setLoading('sidebar', true)
-        try { allSubjects.value = await api.listSubjects() }
-        finally { setLoading('sidebar', false) }
-    }
-
-    async function loadSubject(id) {
-        setLoading(`load:${id}`, true)
+  }
+  async function resumeBatch() {
+    const sid = subjectId.value, report = reports.value[sid]
+    if (!report || report.running || !report.pending?.length) return
+    report.running = true
+    if (!report.unknownDispatch) report.message = ''
+    try { await monitor(report); report.uncertain = !!report.unknownDispatch; if (report.kind === 'expand') await refreshCourses(sid) }
+    catch (e) { report.uncertain = true; report.message = e.message; throw e }
+    finally { report.running = false }
+  }
+  async function runBatch(kind, rows, regenerate = false) {
+    const sid = subjectId.value, name = subjectName.value
+    if (!['outline', 'material', 'exam'].includes(kind)) throw new Error('不支持的生成类型。')
+    if (!sid || reports.value[sid]?.running || reports.value[sid]?.uncertain || !rows.length) return
+    const items = [...new Map(rows.map(r => [itemKey(r), { ...r }])).values()].filter(r => !isLoading(itemKey(r)))
+    if (!items.length) return
+    reports.value[sid] = { kind, total: items.length, done: 0, failures: [], pending: [], running: true, regenerate }
+    const report = reports.value[sid]
+    items.forEach(item => { loadingMap.value[itemKey(item)] = true })
+    try {
+      for (const item of items) {
+        loadingMap.value[itemKey(item)] = true; delete itemErrors.value[itemKey(item)]
+        item.lectureId = outlines.value[itemKey(item)]?.lectureId
+        item.materialId = materials.value[item.lectureId]?.materialId
         try {
-            const snap = await api.getSnapshot(id)
-            subjectId.value   = snap.subject._id
-            subjectName.value = snap.subject.name
-            courses.value     = snap.courses
-            // ── Merge, don't overwrite ──────────────────────────────────────────────
-            // Without merging, if a background batch's onItem fires after the
-            // snapshot for this subject was fetched, its write would be clobbered
-            // by `outlines.value = snap.outlines`. We merge so the snapshot fills
-            // in completed items but any keys written by an active batch survive.
-            // (Stale keys belonging to OTHER subjects don't matter — their course
-            // IDs simply aren't rendered on this page.)
-            outlines.value  = { ...outlines.value,  ...(snap.outlines  || {}) }
-            materials.value = { ...materials.value, ...(snap.materials || {}) }
-            exams.value     = { ...exams.value,     ...(snap.exams     || {}) }
-        } finally {
-            setLoading(`load:${id}`, false)
+          if (kind === 'material' && !item.lectureId) throw new Error('请先生成纲要。')
+          if (kind === 'exam' && !item.materialId) throw new Error('请先生成学习材料。')
+          if (demo.value) {
+            await new Promise(resolve => setTimeout(resolve, 350))
+            const content = demoContent(item.name)
+            finish(report, item, { content: content.outline, material: content.material, questions: content.questions, lecture_id: `demo-lecture-${item.id}`, material_id: `demo-material-${item.id}` }); continue
+          }
+          let dispatch
+          if (kind === 'outline') {
+            const method = item.type === 'course' ? (regenerate ? api.regenerateCourseContent : api.generateCourseContent) : (regenerate ? api.regenerateSubContent : api.generateSubContent)
+            dispatch = await method(item.id, name)
+          } else if (kind === 'material') dispatch = await (regenerate ? api.regenerateMaterial : api.generateMaterial)(item.lectureId)
+          else dispatch = await api.generateExam(item.materialId)
+          if (!dispatch.task_id) throw new Error('服务未返回任务编号。')
+          report.pending.push({ ...item, taskId: dispatch.task_id })
+        } catch (e) {
+          // A lost dispatch response may still have started a paid task. Never auto-retry it.
+          if (!demo.value && (!e.status || e.status >= 500) && !/请先生成/.test(e.message)) {
+            report.unknownDispatch = true; report.uncertain = true
+            report.message = `「${item.name}」提交结果未知。为避免重复计费，已停止提交剩余课程。请刷新内容并在后端核对任务，确认后再重新打开页面。`
+            break
+          }
+          fail(report, item, e)
         }
-    }
-
-    // ── delete ───────────────────────────────────────────────────────────────────
-    async function deleteSubject(id) {
-        setLoading(`del:${id}`, true)
-        try {
-            await api.deleteSubject(id)
-            allSubjects.value = allSubjects.value.filter(s => s._id !== id)
-            // Clear any batch state for the deleted subject so its progress
-            // indicator stops haunting the UI.
-            for (const k of Object.keys(loadingMap.value)) {
-                if (k.endsWith(`:${id}`)) delete loadingMap.value[k]
-            }
-            for (const k of Object.keys(batchProgress.value)) {
-                if (k.endsWith(`:${id}`)) delete batchProgress.value[k]
-            }
-            if (subjectId.value === id) $reset()
-        } finally { setLoading(`del:${id}`, false) }
-    }
-
-    async function deleteSubcategory(subId) {
-        setLoading(`del-sub:${subId}`, true)
-        try {
-            await api.deleteSubcategory(subId)
-            const key = `subcategory:${subId}`
-            const outline = outlines.value[key]
-            if (outline?.lectureId) {
-                const mat = materials.value[outline.lectureId]
-                if (mat?.materialId) delete exams.value[mat.materialId]
-                delete materials.value[outline.lectureId]
-            }
-            delete outlines.value[key]
-            await refreshCourses()
-        } finally { setLoading(`del-sub:${subId}`, false) }
-    }
-
-    async function deleteCourse(courseId) {
-        setLoading(`del-course:${courseId}`, true)
-        try {
-            await api.deleteCourse(courseId)
-            // Local cleanup so the UI doesn't briefly show stale outline/material
-            // panels for a course that just got deleted. refreshCourses() rebuilds
-            // the array from the server, but the outline/material/exam stores are
-            // keyed independently and must be pruned by hand.
-            const course = courses.value.find(c => c._id === courseId)
-
-            // 1. Course's own chain (only present when it had no subcategories)
-            const courseKey = `course:${courseId}`
-            const courseOutline = outlines.value[courseKey]
-            if (courseOutline?.lectureId) {
-                const mat = materials.value[courseOutline.lectureId]
-                if (mat?.materialId) delete exams.value[mat.materialId]
-                delete materials.value[courseOutline.lectureId]
-            }
-            delete outlines.value[courseKey]
-
-            // 2. Each subcategory's chain
-            if (course?.subcategories) {
-                for (const sub of course.subcategories) {
-                    const subKey = `subcategory:${sub._id}`
-                    const subOutline = outlines.value[subKey]
-                    if (subOutline?.lectureId) {
-                        const mat = materials.value[subOutline.lectureId]
-                        if (mat?.materialId) delete exams.value[mat.materialId]
-                        delete materials.value[subOutline.lectureId]
-                    }
-                    delete outlines.value[subKey]
-                }
-            }
-
-            // 3. Drop the course row from the visible list. (refreshCourses below
-            //    would also do this, but optimistically splicing first makes the
-            //    UI update instantly rather than waiting on the GET.)
-            courses.value = courses.value.filter(c => c._id !== courseId)
-            await refreshCourses()
-        } finally {
-            setLoading(`del-course:${courseId}`, false)
-        }
-    }
-
-    // ── skeleton ──────────────────────────────────────────────────────────────────
-    async function generateSkeleton(name) {
-        setLoading('skeleton', true)
-        try {
-            const res = await api.createSubject(name)
-            await loadSubject(res.subject_id)
-            await fetchAllSubjects()
-        } finally { setLoading('skeleton', false) }
-    }
-
-    async function batchCreateSubjects(names) {
-        setLoading('skeleton', true)
-        try {
-            await Promise.all(names.map(async (name) => {
-                await api.createSubject(name)
-            }))
-            await fetchAllSubjects()
-        } finally { setLoading('skeleton', false) }
-    }
-
-    async function refreshCourses(forSubjectId = null) {
-        const sid = forSubjectId || subjectId.value
-        if (!sid) return
-        const fresh = await api.getCourses(sid)
-        // Only update the visible courses array if it still belongs to this
-        // subject — otherwise we'd swap the active page's courses for a
-        // different subject's data.
-        if (subjectId.value === sid) {
-            courses.value = fresh
-        }
-    }
-
-    /**
-     * Expand all courses into subcategories — queued so the API server
-     * doesn't block on N parallel LLM calls.
-     *
-     * State is scoped to the subject this expand was kicked off for, so
-     * navigating to another subject doesn't disable that subject's expand
-     * button.
-     */
-    async function expandAll() {
-        const sid = subjectId.value
-        if (!sid) return
-        const lkey = batchKey('expand', sid)
-        setLoading(lkey, true)
-        batchProgress.value[lkey] = { done: 0, total: 0, failed: 0 }
-        try {
-            const { tasks } = await api.expandSubjectAsync(sid)
-            if (!tasks?.length) return
-            batchProgress.value[lkey].total = tasks.length
-
-            const items = tasks.map(t => ({ taskId: t.task_id, course_id: t.course_id }))
-
-            await pollTasksBatch(items, {
-                onItem: async () => {
-                    if (batchProgress.value[lkey]) batchProgress.value[lkey].done++
-                    await refreshCourses(sid)
-                },
-                onError: () => {
-                    if (batchProgress.value[lkey]) batchProgress.value[lkey].failed++
-                },
-            })
-        } finally {
-            setLoading(lkey, false)
-            delete batchProgress.value[lkey]
-        }
-    }
-
-    // ── outlines (single-task path, kept for individual buttons) ────────────────
-    async function generateOutlines(items) {
-        await Promise.all(items.map(_generateOneOutline))
-    }
-
-    async function _generateOneOutline({ type, id }) {
-        const key = `${type}:${id}`
-        setLoading(key, true)
-        try {
-            const dispatch = type === 'course'
-                ? await api.generateCourseContent(id, subjectName.value)
-                : await api.generateSubContent(id, subjectName.value)
-
-            const res = await pollTask(dispatch.task_id)
-            outlines.value[key] = { lectureId: res.lecture_id, ...res.content }
-            await refreshCourses()
-        } finally {
-            setLoading(key, false)
-        }
-    }
-
-    async function regenerateOutline(type, id) {
-        const key = `${type}:${id}`
-        setLoading(key, true)
-        try {
-            const dispatch = type === 'course'
-                ? await api.regenerateCourseContent(id, subjectName.value)
-                : await api.regenerateSubContent(id, subjectName.value)
-            const res = await pollTask(dispatch.task_id)
-            outlines.value[key] = { lectureId: res.lecture_id, ...res.content }
-        } finally { setLoading(key, false) }
-    }
-
-    // ── materials ─────────────────────────────────────────────────────────────────
-    async function generateMaterial(lectureId) {
-        setLoading(`material:${lectureId}`, true)
-        try {
-            const { task_id } = await api.generateMaterial(lectureId)
-            const res = await pollTask(task_id)
-            materials.value[lectureId] = { materialId: res.material_id, ...res.material }
-        } finally { setLoading(`material:${lectureId}`, false) }
-    }
-
-    async function regenerateMaterial(lectureId) {
-        setLoading(`material:${lectureId}`, true)
-        try {
-            const { task_id } = await api.regenerateMaterial(lectureId)
-            const res = await pollTask(task_id)
-            materials.value[lectureId] = { materialId: res.material_id, ...res.material }
-        } finally { setLoading(`material:${lectureId}`, false) }
-    }
-
-    // ── exams ─────────────────────────────────────────────────────────────────────
-    async function generateExam(materialId) {
-        setLoading(`exam:${materialId}`, true)
-        try {
-            const { task_id } = await api.generateExam(materialId)
-            const res = await pollTask(task_id)
-            exams.value[materialId] = res.questions
-        } finally { setLoading(`exam:${materialId}`, false) }
-    }
-
-    // ── batch (high-concurrency path) ────────────────────────────────────────────
-    //
-    // The state for one batch belongs to the subject it was started on:
-    //   - The "全选纲要" button on that subject reflects its own progress.
-    //   - The same button on OTHER subjects is unaffected — users can kick off
-    //     batches on multiple subjects concurrently and each tracks itself.
-    //   - Navigating away and back leaves the batch running; the per-item
-    //     spinners and progress counter both survive navigation.
-    //
-    // Per-item loading flags (`course:xxx`, `subcategory:yyy`, `material:zzz`)
-    // are global — keyed by the actual resource id, which is globally unique
-    // — so they keep working across navigations without modification.
-
-    async function batchGenerateOutlines(items) {
-        if (!items.length) return
-        const sid  = subjectId.value
-        if (!sid) return
-        const lkey = batchKey('batch-outline', sid)
-        setLoading(lkey, true)
-        batchProgress.value[lkey] = { done: 0, total: items.length, failed: 0 }
-        try {
-            const enqueued = await Promise.all(items.map(async ({ type, id }) => {
-                const key = `${type}:${id}`
-                setLoading(key, true)
-                try {
-                    const dispatch = type === 'course'
-                        ? await api.generateCourseContent(id, subjectName.value)
-                        : await api.generateSubContent(id, subjectName.value)
-                    return { taskId: dispatch.task_id, type, id, key }
-                } catch (e) {
-                    setLoading(key, false)
-                    if (batchProgress.value[lkey]) batchProgress.value[lkey].failed++
-                    return null
-                }
-            }))
-            const tracked = enqueued.filter(Boolean)
-            if (!tracked.length) return
-
-            await pollTasksBatch(tracked, {
-                onItem: ({ item, result }) => {
-                    outlines.value[item.key] = { lectureId: result.lecture_id, ...result.content }
-                    setLoading(item.key, false)
-                    if (batchProgress.value[lkey]) batchProgress.value[lkey].done++
-                },
-                onError: ({ item }) => {
-                    setLoading(item.key, false)
-                    if (batchProgress.value[lkey]) batchProgress.value[lkey].failed++
-                },
-            })
-
-            await refreshCourses(sid)
-        } finally {
-            setLoading(lkey, false)
-            delete batchProgress.value[lkey]
-        }
-    }
-
-    async function batchGenerateMaterials(items) {
-        if (!items.length) return
-        const sid  = subjectId.value
-        if (!sid) return
-        const lkey = batchKey('batch-material', sid)
-        setLoading(lkey, true)
-        batchProgress.value[lkey] = { done: 0, total: items.length, failed: 0 }
-        try {
-            const enqueued = await Promise.all(items.map(async ({ type, id }) => {
-                const outline = outlines.value[`${type}:${id}`]
-                if (!outline?.lectureId) return null
-                const lectureId = outline.lectureId
-                setLoading(`material:${lectureId}`, true)
-                try {
-                    const { task_id } = await api.generateMaterial(lectureId)
-                    return { taskId: task_id, lectureId }
-                } catch {
-                    setLoading(`material:${lectureId}`, false)
-                    if (batchProgress.value[lkey]) batchProgress.value[lkey].failed++
-                    return null
-                }
-            }))
-            const tracked = enqueued.filter(Boolean)
-            if (!tracked.length) return
-
-            await pollTasksBatch(tracked, {
-                onItem: ({ item, result }) => {
-                    materials.value[item.lectureId] = { materialId: result.material_id, ...result.material }
-                    setLoading(`material:${item.lectureId}`, false)
-                    if (batchProgress.value[lkey]) batchProgress.value[lkey].done++
-                },
-                onError: ({ item }) => {
-                    setLoading(`material:${item.lectureId}`, false)
-                    if (batchProgress.value[lkey]) batchProgress.value[lkey].failed++
-                },
-            })
-        } finally {
-            setLoading(lkey, false)
-            delete batchProgress.value[lkey]
-        }
-    }
-
-    async function batchGenerateExams(items) {
-        if (!items.length) return
-        const sid  = subjectId.value
-        if (!sid) return
-        const lkey = batchKey('batch-exam', sid)
-        setLoading(lkey, true)
-        batchProgress.value[lkey] = { done: 0, total: items.length, failed: 0 }
-        try {
-            const enqueued = await Promise.all(items.map(async ({ type, id }) => {
-                const outline = outlines.value[`${type}:${id}`]
-                if (!outline?.lectureId) return null
-                const mat = materials.value[outline.lectureId]
-                if (!mat?.materialId) return null
-                const materialId = mat.materialId
-                setLoading(`exam:${materialId}`, true)
-                try {
-                    const { task_id } = await api.generateExam(materialId)
-                    return { taskId: task_id, materialId }
-                } catch {
-                    setLoading(`exam:${materialId}`, false)
-                    if (batchProgress.value[lkey]) batchProgress.value[lkey].failed++
-                    return null
-                }
-            }))
-            const tracked = enqueued.filter(Boolean)
-            if (!tracked.length) return
-
-            await pollTasksBatch(tracked, {
-                onItem: ({ item, result }) => {
-                    exams.value[item.materialId] = result.questions
-                    setLoading(`exam:${item.materialId}`, false)
-                    if (batchProgress.value[lkey]) batchProgress.value[lkey].done++
-                },
-                onError: ({ item }) => {
-                    setLoading(`exam:${item.materialId}`, false)
-                    if (batchProgress.value[lkey]) batchProgress.value[lkey].failed++
-                },
-            })
-        } finally {
-            setLoading(lkey, false)
-            delete batchProgress.value[lkey]
-        }
-    }
-
-    function $reset() {
-        subjectId.value = null; subjectName.value = ''; courses.value = []
-        outlines.value = {}; materials.value = {}; exams.value = {}
-        // NOTE: we deliberately DON'T clear loadingMap / batchProgress here —
-        // background work on other subjects must keep updating its own state.
-        // Per-subject keys for the subject being reset (when it's deleted) are
-        // cleaned by deleteSubject().
-    }
-
-    return {
-        allSubjects, subjectId, subjectName, courses, outlines, materials, exams,
-        loadingMap, batchProgress,
-        isLoading,
-        isBatchActive, batchInfo, activeWorkSubjects,
-        fetchAllSubjects, loadSubject,
-        deleteSubject, deleteSubcategory, deleteCourse,
-        generateSkeleton, batchCreateSubjects, refreshCourses, expandAll,
-        generateOutlines, regenerateOutline,
-        batchGenerateOutlines, batchGenerateMaterials, batchGenerateExams,
-        generateMaterial, regenerateMaterial,
-        generateExam,
-        $reset,
-    }
+      }
+      if (report.pending.length) await monitor(report)
+    } catch (e) {
+      report.message = e.message
+      report.uncertain = true // Polling failure does not prove server-side failure.
+      throw e
+    } finally { items.forEach(item => { loadingMap.value[itemKey(item)] = false }); report.running = false }
+  }
+  async function deleteItem(item) {
+    if (anyWork.value) throw new Error('请等待当前操作完成后再删除。')
+    if (demo.value) throw new Error('示例模式不删除课程，请切换到真实工作区。')
+    const sid = subjectId.value
+    await (item.type === 'course' ? api.deleteCourse(item.id) : api.deleteSubcategory(item.id))
+    delete outlines.value[itemKey(item)]; await refreshCourses(sid)
+  }
+  async function deleteSubject(id) {
+    if (anyWork.value) throw new Error('请等待当前操作完成后再删除。')
+    if (demo.value) throw new Error('示例模式不删除真实数据。')
+    await api.deleteSubject(id); allSubjects.value = allSubjects.value.filter(s => s._id !== id)
+    if (subjectId.value === id) home()
+    delete reports.value[id]
+  }
+  function enterDemo() {
+    if (anyWork.value) throw new Error('请等待当前操作完成，再进入示例。')
+    ++navigation; demo.value = true
+    const snap = createDemoSnapshot()
+    allSubjects.value = [snap.subject]; subjectId.value = snap.subject._id; subjectName.value = snap.subject.name
+    courses.value = snap.courses; outlines.value = snap.outlines; materials.value = snap.materials; exams.value = snap.exams
+    reports.value = {}; itemErrors.value = {}; versions.clear()
+  }
+  async function exitDemo() {
+    if (anyWork.value) return
+    demo.value = false; home(); allSubjects.value = []; outlines.value = {}; materials.value = {}; exams.value = {}
+    reports.value = {}; itemErrors.value = {}; versions.clear(); await fetchAllSubjects()
+  }
+  return { allSubjects, subjectId, subjectName, courses, outlines, materials, exams, demo, online,
+    reports, currentReport, itemErrors, isLoading, anyWork, activeWorkSubjects,
+    fetchAllSubjects, loadSubject, home, createSubjects, expandAll, runBatch, resumeBatch, deleteItem, deleteSubject, enterDemo, exitDemo }
 })

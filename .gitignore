@@ -2,10 +2,40 @@ node_modules/
 dist/
 .vite/
 
+# Local exports, temporary files and test artifacts
+output/
+tmp/
+coverage/
+playwright-report/
+test-results/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
 # Local environment files
 .env
 .env.*
 !.env.example
+.envrc
+
+# Local credentials and data backups
+.secrets/
+.aws/
+.ssh/
+.npmrc
+.netrc
+.git-credentials
+*.pem
+*.key
+*.p12
+*.pfx
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.bak
 
 # Logs
 *.log
